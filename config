@@ -9,3 +9,612 @@
 [branch "main"]
 	remote = origin
 	merge = refs/heads/main
+import { useState, useEffect, useRef } from 'react';
+import { BrowserRouter, Routes, Route, Link, useNavigate, useParams } from 'react-router-dom';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, updateDoc, arrayUnion, arrayRemove, where, getDocs, deleteDoc, setDoc, getDoc } from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { FaHome, FaUserFriends, FaBell, FaStore, FaFacebookMessenger, FaVideo, FaImage, FaThumbsUp, FaComment } from 'react-icons/fa';
+import { formatDistanceToNow } from 'date-fns';
+
+// 1. PASTE YOUR FIREBASE CONFIG HERE
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_AUTH_DOMAIN",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_STORAGE_BUCKET",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const storage = getStorage(app);
+
+// MAIN APP
+function App() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    onAuthStateChanged(auth, async (currentUser) => {
+      if (currentUser) {
+        // Create user doc if not exists
+        const userRef = doc(db, "users", currentUser.uid);
+        const userSnap = await getDoc(userRef);
+        if (!userSnap.exists()) {
+          await setDoc(userRef, {
+            uid: currentUser.uid,
+            name: currentUser.displayName,
+            photoURL: currentUser.photoURL,
+            email: currentUser.email,
+            friends: [],
+            createdAt: serverTimestamp()
+          });
+        }
+        setUser(currentUser);
+      } else {
+        setUser(null);
+      }
+      setLoading(false);
+    });
+  }, []);
+
+  const login = () => signInWithPopup(auth, new GoogleAuthProvider());
+  const logout = () => signOut(auth);
+
+  if (loading) return <div className="h-screen flex items-center justify-center">Loading...</div>;
+  if (!user) return <LoginPage login={login} />;
+
+  return (
+    <BrowserRouter>
+      <div className="bg-gray-100 min-h-screen">
+        <NavBar user={user} logout={logout} />
+        <div className="max-w-6xl mx-auto pt-16 flex">
+          <Routes>
+            <Route path="/" element={<HomePage user={user} />} />
+            <Route path="/friends" element={<FriendsPage user={user} />} />
+            <Route path="/messages" element={<ChatListPage user={user} />} />
+            <Route path="/messages/:chatId" element={<ChatPage user={user} />} />
+            <Route path="/marketplace" element={<MarketplacePage user={user} />} />
+            <Route path="/notifications" element={<NotificationsPage user={user} />} />
+            <Route path="/profile/:userId" element={<ProfilePage user={user} />} />
+          </Routes>
+        </div>
+      </div>
+    </BrowserRouter>
+  );
+}
+
+// LOGIN PAGE
+const LoginPage = ({ login }) => (
+  <div className="h-screen flex flex-col items-center justify-center bg-blue-600 text-white">
+    <h1 className="text-5xl font-bold mb-4">NaijaSocial</h1>
+    <p className="mb-8">Connect with friends in Nigeria</p>
+    <button onClick={login} className="bg-white text-blue-600 px-8 py-3 rounded-lg font-bold text-lg">Login with Google</button>
+  </div>
+);
+
+// NAVBAR
+const NavBar = ({ user, logout }) => {
+  const [notifCount, setNotifCount] = useState(0);
+
+  useEffect(() => {
+    const q = query(collection(db, "notifications"), where("to", "==", user.uid), where("read", "==", false));
+    const unsub = onSnapshot(q, (snap) => setNotifCount(snap.size));
+    return unsub;
+  }, [user.uid]);
+
+  return (
+    <header className="bg-white shadow fixed w-full z-10">
+      <div className="max-w-6xl mx-auto flex justify-between items-center p-2">
+        <Link to="/" className="text-2xl font-bold text-blue-600">NaijaSocial</Link>
+        <div className="flex gap-6 text-2xl text-gray-600">
+          <Link to="/"><FaHome /></Link>
+          <Link to="/friends"><FaUserFriends /></Link>
+          <Link to="/messages"><FaFacebookMessenger /></Link>
+          <Link to="/marketplace"><FaStore /></Link>
+          <Link to="/notifications" className="relative">
+            <FaBell />
+            {notifCount > 0 && <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">{notifCount}</span>}
+          </Link>
+        </div>
+        <div className="flex items-center gap-3">
+          <Link to={`/profile/${user.uid}`}><img src={user.photoURL} className="w-8 h-8 rounded-full" /></Link>
+          <button onClick={logout} className="text-sm">Logout</button>
+        </div>
+      </div>
+    </header>
+  );
+};
+
+// HOME FEED + CREATE POST
+const HomePage = ({ user }) => {
+  const [posts, setPosts] = useState([]);
+  const [newPost, setNewPost] = useState("");
+  const [file, setFile] = useState(null);
+  const [fileType, setFileType] = useState(""); // image or video
+  const fileRef = useRef();
+
+  useEffect(() => {
+    const q = query(collection(db, "posts"), orderBy("createdAt", "desc"));
+    const unsub = onSnapshot(q, (snapshot) => {
+      setPosts(snapshot.docs.map(doc => ({id: doc.id,...doc.data()})));
+    });
+    return unsub;
+  }, []);
+
+  const handleFile = (e, type) => {
+    setFile(e.target.files[0]);
+    setFileType(type);
+  };
+
+  const createPost = async () => {
+    if (!newPost &&!file) return;
+    let fileUrl = "";
+    if (file) {
+      const fileRef = ref(storage, `posts/${Date.now()}_${file.name}`);
+      await uploadBytes(fileRef, file);
+      fileUrl = await getDownloadURL(fileRef);
+    }
+    await addDoc(collection(db, "posts"), {
+      text: newPost,
+      fileUrl,
+      fileType,
+      uid: user.uid,
+      name: user.displayName,
+      photoURL: user.photoURL,
+      likes: [],
+      createdAt: serverTimestamp()
+    });
+    setNewPost(""); setFile(null); setFileType(""); fileRef.current.value = "";
+  };
+
+  const toggleLike = async (post) => {
+    const postRef = doc(db, "posts", post.id);
+    if (post.likes.includes(user.uid)) {
+      await updateDoc(postRef, { likes: arrayRemove(user.uid) });
+    } else {
+      await updateDoc(postRef, { likes: arrayUnion(user.uid) });
+      // Send notification
+      if (post.uid!== user.uid) {
+        await addDoc(collection(db, "notifications"), {
+          to: post.uid,
+          from: user.uid,
+          fromName: user.displayName,
+          fromPhoto: user.photoURL,
+          type: "like",
+          postId: post.id,
+          read: false,
+          createdAt: serverTimestamp()
+        });
+      }
+    }
+  };
+
+  return (
+    <div className="flex-1 max-w-2xl mx-auto p-4">
+      {/* CREATE POST */}
+      <div className="bg-white p-4 rounded-lg shadow mb-4">
+        <div className="flex gap-2">
+          <img src={user.photoURL} className="w-10 h-10 rounded-full" />
+          <textarea
+            value={newPost}
+            onChange={e => setNewPost(e.target.value)}
+            placeholder={`What's on your mind, ${user.displayName}?`}
+            className="w-full p-2 bg-gray-100 rounded-2xl resize-none"
+          />
+        </div>
+        <div className="flex justify-between items-center mt-3 pt-3 border-t">
+          <div className="flex gap-4">
+            <label className="flex items-center gap-1 cursor-pointer text-gray-600">
+              <FaImage className="text-green-500" /> Photo
+              <input type="file" accept="image/*" ref={fileRef} onChange={(e) => handleFile(e, "image")} className="hidden" />
+            </label>
+            <label className="flex items-center gap-1 cursor-pointer text-gray-600">
+              <FaVideo className="text-red-500" /> Video
+              <input type="file" accept="video/*" onChange={(e) => handleFile(e, "video")} className="hidden" />
+            </label>
+          </div>
+          <button onClick={createPost} className="bg-blue-600 text-white px-6 py-1 rounded-lg font-bold">Post</button>
+        </div>
+        {file && <p className="text-sm mt-2">Selected: {file.name}</p>}
+      </div>
+
+      {/* POSTS FEED */}
+      {posts.map(post => <PostCard key={post.id} post={post} user={user} toggleLike={toggleLike} />)}
+    </div>
+  );
+};
+
+// POST CARD
+const PostCard = ({ post, user, toggleLike }) => {
+  const [comments, setComments] = useState([]);
+  const [commentText, setCommentText] = useState("");
+  const [showComments, setShowComments] = useState(false);
+
+  useEffect(() => {
+    if (showComments) {
+      const q = query(collection(db, "posts", post.id, "comments"), orderBy("createdAt", "asc"));
+      const unsub = onSnapshot(q, (snap) => setComments(snap.docs.map(d => ({id: d.id,...d.data()}))));
+      return unsub;
+    }
+  }, [showComments, post.id]);
+
+  const addComment = async () => {
+    if (!commentText) return;
+    await addDoc(collection(db, "posts", post.id, "comments"), {
+      text: commentText,
+      uid: user.uid,
+      name: user.displayName,
+      photoURL: user.photoURL,
+      createdAt: serverTimestamp()
+    });
+    setCommentText("");
+  };
+
+  return (
+    <div className="bg-white p-4 rounded-lg shadow mb-4">
+      <div className="flex items-center gap-2 mb-2">
+        <Link to={`/profile/${post.uid}`}><img src={post.photoURL} className="w-10 h-10 rounded-full" /></Link>
+        <div>
+          <Link to={`/profile/${post.uid}`} className="font-bold">{post.name}</Link>
+          <p className="text-xs text-gray-500">{post.createdAt?.toDate()? formatDistanceToNow(post.createdAt.toDate()) + ' ago' : ''}</p>
+        </div>
+      </div>
+      <p className="mb-3">{post.text}</p>
+      {post.fileUrl && post.fileType === "image" && <img src={post.fileUrl} className="w-full rounded-lg mb-3" />}
+      {post.fileUrl && post.fileType === "video" && <video src={post.fileUrl} controls className="w-full rounded-lg mb-3" />}
+      <div className="flex justify-between text-gray-600 border-t border-b py-2">
+        <button onClick={() => toggleLike(post)} className={`flex items-center gap-1 ${post.likes.includes(user.uid)? 'text-blue-600' : ''}`}>
+          <FaThumbsUp /> Like {post.likes.length}
+        </button>
+        <button onClick={() => setShowComments(!showComments)} className="flex items-center gap-1">
+          <FaComment /> Comment {comments.length}
+        </button>
+      </div>
+      {showComments && (
+        <div className="mt-3">
+          {comments.map(c => (
+            <div key={c.id} className="flex gap-2 mb-2">
+              <img src={c.photoURL} className="w-8 h-8 rounded-full" />
+              <div className="bg-gray-100 p-2 rounded-xl">
+                <p className="font-bold text-sm">{c.name}</p>
+                <p className="text-sm">{c.text}</p>
+              </div>
+            </div>
+          ))}
+          <div className="flex gap-2 mt-2">
+            <img src={user.photoURL} className="w-8 h-8 rounded-full" />
+            <input value={commentText} onChange={e => setCommentText(e.target.value)} placeholder="Write a comment..." className="flex-1 bg-gray-100 rounded-2xl px-3" />
+            <button onClick={addComment} className="text-blue-600 font-bold">Post</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// FRIEND REQUESTS PAGE
+const FriendsPage = ({ user }) => {
+  const [requests, setRequests] = useState([]);
+  const [suggestions, setSuggestions] = useState([]);
+  const [friends, setFriends] = useState([]);
+
+  useEffect(() => {
+    // Get friend requests
+    const q = query(collection(db, "friendRequests"), where("to", "==", user.uid), where("status", "==", "pending"));
+    const unsub = onSnapshot(q, async (snap) => {
+      const reqs = [];
+      for (const d of snap.docs) {
+        const fromUser = await getDoc(doc(db, "users", d.data().from));
+        reqs.push({ id: d.id,...d.data(), fromUser: fromUser.data() });
+      }
+      setRequests(reqs);
+    });
+
+    // Get all users for suggestions
+    getDocs(collection(db, "users")).then(snap => {
+      setSuggestions(snap.docs.map(d => d.data()).filter(u => u.uid!== user.uid));
+    });
+
+    // Get friends
+    getDoc(doc(db, "users", user.uid)).then(snap => {
+      setFriends(snap.data()?.friends || []);
+    });
+
+    return unsub;
+  }, [user.uid]);
+
+  const sendRequest = async (toUserId) => {
+    await addDoc(collection(db, "friendRequests"), {
+      from: user.uid,
+      to: toUserId,
+      status: "pending",
+      createdAt: serverTimestamp()
+    });
+    await addDoc(collection(db, "notifications"), {
+      to: toUserId,
+      from: user.uid,
+      fromName: user.displayName,
+      fromPhoto: user.photoURL,
+      type: "friend_request",
+      read: false,
+      createdAt: serverTimestamp()
+    });
+  };
+
+  const acceptRequest = async (req) => {
+    await updateDoc(doc(db, "users", user.uid), { friends: arrayUnion(req.from) });
+    await updateDoc(doc(db, "users", req.from), { friends: arrayUnion(user.uid) });
+    await updateDoc(doc(db, "friendRequests", req.id), { status: "accepted" });
+  };
+
+  return (
+    <div className="flex-1 max-w-2xl mx-auto p-4">
+      <h2 className="text-xl font-bold mb-4">Friend Requests</h2>
+      {requests.map(req => (
+        <div key={req.id} className="bg-white p-4 rounded-lg shadow mb-2 flex justify-between items-center">
+          <div className="flex items-center gap-2">
+            <img src={req.fromUser.photoURL} className="w-12 h-12 rounded-full" />
+            <p className="font-bold">{req.fromUser.name}</p>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => acceptRequest(req)} className="bg-blue-600 text-white px-4 py-1 rounded">Confirm</button>
+            <button className="bg-gray-200 px-4 py-1 rounded">Delete</button>
+          </div>
+        </div>
+      ))}
+
+      <h2 className="text-xl font-bold mb-4 mt-6">People You May Know</h2>
+      {suggestions.filter(s =>!friends.includes(s.uid)).map(s => (
+        <div key={s.uid} className="bg-white p-4 rounded-lg shadow mb-2 flex justify-between items-center">
+          <div className="flex items-center gap-2">
+            <img src={s.photoURL} className="w-12 h-12 rounded-full" />
+            <p className="font-bold">{s.name}</p>
+          </div>
+          <button onClick={() => sendRequest(s.uid)} className="bg-gray-200 text-blue-600 px-4 py-1 rounded font-bold">Add Friend</button>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// CHAT LIST + CHAT PAGE
+const ChatListPage = ({ user }) => {
+  const [chats, setChats] = useState([]);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    const q = query(collection(db, "chats"), where("users", "array-contains", user.uid));
+    const unsub = onSnapshot(q, async (snap) => {
+      const chatData = [];
+      for (const d of snap.docs) {
+        const otherUserId = d.data().users.find(u => u!== user.uid);
+        const otherUser = await getDoc(doc(db, "users", otherUserId));
+        chatData.push({ id: d.id,...d.data(), otherUser: otherUser.data() });
+      }
+      setChats(chatData);
+    });
+    return unsub;
+  }, [user.uid]);
+
+  return (
+    <div className="flex-1 max-w-2xl mx-auto p-4">
+      <h2 className="text-xl font-bold mb-4">Messages</h2>
+      {chats.map(chat => (
+        <div key={chat.id} onClick={() => navigate(`/messages/${chat.id}`)} className="bg-white p-4 rounded-lg shadow mb-2 flex items-center gap-3 cursor-pointer">
+          <img src={chat.otherUser.photoURL} className="w-12 h-12 rounded-full" />
+          <div>
+            <p className="font-bold">{chat.otherUser.name}</p>
+            <p className="text-sm text-gray-500">{chat.lastMessage}</p>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const ChatPage = ({ user }) => {
+  const { chatId } = useParams();
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState("");
+  const [otherUser, setOtherUser] = useState(null);
+
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "chats", chatId, "messages"), orderBy("createdAt", "asc"), (snap) => {
+      setMessages(snap.docs.map(d => ({id: d.id,...d.data()})));
+    });
+    getDoc(doc(db, "chats", chatId)).then(async snap => {
+      const otherUserId = snap.data().users.find(u => u!== user.uid);
+      const otherUserSnap = await getDoc(doc(db, "users", otherUserId));
+      setOtherUser(otherUserSnap.data());
+    });
+    return unsub;
+  }, [chatId, user.uid]);
+
+  const sendMessage = async () => {
+    if (!text) return;
+    await addDoc(collection(db, "chats", chatId, "messages"), {
+      text,
+      sender: user.uid,
+      createdAt: serverTimestamp()
+    });
+    await updateDoc(doc(db, "chats", chatId), {
+      lastMessage: text,
+      lastTime: serverTimestamp()
+    });
+    setText("");
+  };
+
+  return (
+    <div className="flex-1 max-w-2xl mx-auto flex flex-col h-[calc(100vh-4rem)]">
+      <div className="bg-white p-3 shadow flex items-center gap-2">
+        <img src={otherUser?.photoURL} className="w-10 h-10 rounded-full" />
+        <p className="font-bold">{otherUser?.name}</p>
+      </div>
+      <div className="flex-1 overflow-y-auto p-4 bg-gray-200">
+        {messages.map(m => (
+          <div key={m.id} className={`flex mb-2 ${m.sender === user.uid? 'justify-end' : 'justify-start'}`}>
+            <div className={`p-2 rounded-lg max-w-xs ${m.sender === user.uid? 'bg-blue-500 text-white' : 'bg-white'}`}>
+              {m.text}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="bg-white p-3 flex gap-2">
+        <input value={text} onChange={e => setText(e.target.value)} className="flex-1 bg-gray-100 rounded-2xl px-4" placeholder="Type a message..." />
+        <button onClick={sendMessage} className="bg-blue-600 text-white px-4 rounded-2xl">Send</button>
+      </div>
+    </div>
+  );
+};
+
+// MARKETPLACE PAGE
+const MarketplacePage = ({ user }) => {
+  const [items, setItems] = useState([]);
+  const [title, setTitle] = useState("");
+  const [price, setPrice] = useState("");
+  const [image, setImage] = useState(null);
+
+  useEffect(() => {
+    const q = query(collection(db, "marketplace"), orderBy("createdAt", "desc"));
+    const unsub = onSnapshot(q, (snap) => setItems(snap.docs.map(d => ({id: d.id,...d.data()}))));
+    return unsub;
+  }, []);
+
+  const createListing = async () => {
+    if (!title ||!price ||!image) return;
+    const imageRef = ref(storage, `marketplace/${Date.now()}_${image.name}`);
+    await uploadBytes(imageRef, image);
+    const imageUrl = await getDownloadURL(imageRef);
+    await addDoc(collection(db, "marketplace"), {
+      title, price, imageUrl,
+      seller: user.uid,
+      sellerName: user.displayName,
+      sellerPhoto: user.photoURL,
+      createdAt: serverTimestamp()
+    });
+    setTitle(""); setPrice(""); setImage(null);
+  };
+
+  return (
+    <div className="flex-1 max-w-4xl mx-auto p-4">
+      <div className="bg-white p-4 rounded-lg shadow mb-4">
+        <h2 className="font-bold mb-2">Sell Something</h2>
+        <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Item title" className="w-full p-2 border rounded mb-2" />
+        <input value={price} onChange={e => setPrice(e.target.value)} placeholder="Price ₦" className="w-full p-2 border rounded mb-2" />
+        <input type="file" onChange={e => setImage(e.target.files[0])} className="mb-2" />
+        <button onClick={createListing} className="bg-blue-600 text-white px-4 py-2 rounded">List Item</button>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {items.map(item => (
+          <div key={item.id} className="bg-white rounded-lg shadow">
+            <img src={item.imageUrl} className="w-full h-40 object-cover rounded-t-lg" />
+            <div className="p-2">
+              <p className="font-bold">₦{item.price}</p>
+              <p className="text-sm">{item.title}</p>
+              <p className="text-xs text-gray-500">Seller: {item.sellerName}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// NOTIFICATIONS PAGE
+const NotificationsPage = ({ user }) => {
+  const [notifs, setNotifs] = useState([]);
+
+  useEffect(() => {
+    const q = query(collection(db, "notifications"), where("to", "==", user.uid), orderBy("createdAt", "desc"));
+    const unsub = onSnapshot(q, (snap) => {
+      setNotifs(snap.docs.map(d => ({id: d.id,...d.data()})));
+      // Mark as read
+      snap.docs.forEach(async d => {
+        if (!d.data().read) await updateDoc(doc(db, "notifications", d.id), { read: true });
+      });
+    });
+    return unsub;
+  }, [user.uid]);
+
+  return (
+    <div className="flex-1 max-w-2xl mx-auto p-4">
+      <h2 className="text-xl font-bold mb-4">Notifications</h2>
+      {notifs.map(n => (
+        <div key={n.id} className="bg-white p-4 rounded-lg shadow mb-2 flex items-center gap-3">
+          <img src={n.fromPhoto} className="w-12 h-12 rounded-full" />
+          <div>
+            <p><span className="font-bold">{n.fromName}</span>
+              {n.type === "like" && " liked your post"}
+              {n.type === "friend_request" && " sent you a friend request"}
+              {n.type === "comment" && " commented on your post"}
+            </p>
+            <p className="text-xs text-gray-500">{n.createdAt?.toDate()? formatDistanceToNow(n.createdAt.toDate()) + ' ago' : ''}</p>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// PROFILE PAGE
+const ProfilePage = ({ user }) => {
+  const { userId } = useParams();
+  const [profile, setProfile] = useState(null);
+  const [userPosts, setUserPosts] = useState([]);
+  const [isFriend, setIsFriend] = useState(false);
+
+  useEffect(() => {
+    getDoc(doc(db, "users", userId)).then(snap => setProfile(snap.data()));
+    const q = query(collection(db, "posts"), where("uid", "==", userId), orderBy("createdAt", "desc"));
+    onSnapshot(q, (snap) => setUserPosts(snap.docs.map(d => ({id: d.id,...d.data()}))));
+
+    getDoc(doc(db, "users", user.uid)).then(snap => {
+      setIsFriend(snap.data()?.friends?.includes(userId));
+    });
+  }, [userId, user.uid]);
+
+  const startChat = async () => {
+    // Check if chat exists
+    const q = query(collection(db, "chats"), where("users", "array-contains", user.uid));
+    const snap = await getDocs(q);
+    const existing = snap.docs.find(d => d.data().users.includes(userId));
+    if (existing) {
+      window.location.href = `/messages/${existing.id}`;
+    } else {
+      const newChat = await addDoc(collection(db, "chats"), {
+        users: [user.uid, userId],
+        createdAt: serverTimestamp()
+      });
+      window.location.href = `/messages/${newChat.id}`;
+    }
+  };
+
+  if (!profile) return <div className="p-4">Loading...</div>;
+
+  return (
+    <div className="flex-1 max-w-2xl mx-auto p-4">
+      <div className="bg-white rounded-lg shadow mb-4">
+        <div className="h-48 bg-blue-500 rounded-t-lg"></div>
+        <div className="p-4">
+          <img src={profile.photoURL} className="w-32 h-32 rounded-full border-4 border-white -mt-16" />
+          <h1 className="text-2xl font-bold mt-2">{profile.name}</h1>
+          {user.uid!== userId && (
+            <div className="flex gap-2 mt-2">
+              <button onClick={startChat} className="bg-blue-600 text-white px-4 py-2 rounded">Message</button>
+              {!isFriend && <button className="bg-gray-200 px-4 py-2 rounded">Add Friend</button>}
+            </div>
+          )}
+        </div>
+      </div>
+      <h2 className="font-bold mb-2">Posts</h2>
+      {userPosts.map(post => <PostCard key={post.id} post={post} user={user} toggleLike={() => {}} />)}
+    </div>
+  );
+};
+
+export default App;
